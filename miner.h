@@ -1304,6 +1304,8 @@ struct pool {
 	char *sessionid;
 	bool has_stratum;
 	bool stratum_active;
+	bool tls_active;
+	bool tls_only;
 	bool stratum_init;
 	bool stratum_notify;
 	struct stratum_work swork;

@@ -957,9 +957,12 @@ bool detect_stratum(struct pool *pool, char *url)
 	if (!extract_sockaddr(url, &pool->sockaddr_url, &pool->stratum_port))
 		goto out;
 
-	if (!strncasecmp(url, "stratum+tcp://", 14)) {
+	bool has_stratum = !strncasecmp(url, "stratum+tcp://", 14) || !strncasecmp(url, "stratum+tls://", 14);
+	bool tls_only = !strncasecmp(url, "stratum+tls://", 14);
+	if (has_stratum) {
 		pool->rpc_url = strdup(url);
 		pool->has_stratum = true;
+		pool->tls_only = tls_only;
 		pool->stratum_url = pool->sockaddr_url;
 		ret = true;
 	}
@@ -989,7 +992,8 @@ static char *setup_url(struct pool *pool, char *arg)
 
 	opt_set_charp(arg, &pool->rpc_url);
 	if (strncmp(arg, "http://", 7) &&
-	    strncmp(arg, "https://", 8)) {
+	    strncmp(arg, "https://", 8) &&
+	    strncmp(arg, "stratum+tls://", 14)) {
 		char httpinput[256];
 
 		strcpy(httpinput, "stratum+tcp://");
@@ -3190,8 +3194,8 @@ static void curses_print_status(void)
 		cg_mvwprintw(statuswin, 4, 0, " Connected to multiple pools with%s block change notify",
 			have_longpoll ? "": "out");
 	} else if (pool->has_stratum) {
-		cg_mvwprintw(statuswin, 4, 0, " Connected to %s diff %s with stratum as user %s",
-			pool->sockaddr_url, pool->diff, pool->rpc_user);
+		cg_mvwprintw(statuswin, 4, 0, " Connected to %s diff %s with stratum%s as user %s",
+			pool->sockaddr_url, pool->diff, pool->tls_active ? "+tls" : "+tcp", pool->rpc_user);
 	} else {
 		cg_mvwprintw(statuswin, 4, 0, " Connected to %s diff %s with%s %s as user %s",
 			pool->sockaddr_url, pool->diff, have_longpoll ? "": "out",

@@ -2718,8 +2718,9 @@ static bool setup_stratum_curl(struct pool *pool)
 	CURL *curl = NULL;
 	char s[RBUFSIZE];
 	bool ret = false;
-	bool tls_only = false, try_tls = true;
-	bool tlsca = true;
+	
+	// Try to activate TLS by default
+	pool->tls_active = true;
 	
 	applog(LOG_DEBUG, "initiate_stratum with sockbuf=%p", pool->sockbuf);
 	mutex_lock(&pool->stratum_lock);
@@ -2760,8 +2761,8 @@ static bool setup_stratum_curl(struct pool *pool)
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, pool);
 	
 	curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_TRY);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, (long)(tlsca ? 2 : 0));
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, (long)(tlsca ? 1 : 0));
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 	if (pool->rpc_proxy) {
 		curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
 		curl_easy_setopt(curl, CURLOPT_PROXY, pool->rpc_proxy);
@@ -2774,19 +2775,19 @@ static bool setup_stratum_curl(struct pool *pool)
 	
 retry:
 	/* Create a http url for use with curl */
-	sprintf(s, "http%s://%s:%s", try_tls ? "s" : "",
+	sprintf(s, "http%s://%s:%s", pool->tls_active ? "s" : "",
 	        pool->sockaddr_url, pool->stratum_port);
 	curl_easy_setopt(curl, CURLOPT_URL, s);
 	
 	pool->sock = INVSOCK;
 	if (curl_easy_perform(curl)) {
-		if (try_tls)
+		if (pool->tls_active)
 		{
 			applog(LOG_DEBUG, "Stratum connect failed with TLS to pool %u: %s",
 			       pool->pool_no, pool->curl_err_str);
-			if (!tls_only)
+			if (!pool->tls_only)
 			{
-				try_tls = false;
+				pool->tls_active = false;
 				goto retry;
 			}
 		}
