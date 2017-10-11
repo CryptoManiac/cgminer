@@ -59,6 +59,22 @@ int no_yield(void)
 
 int (*selective_yield)(void) = &no_yield;
 
+void set_cloexec_socket(SOCKETTYPE sock, const bool cloexec)
+{
+#ifdef WIN32
+	SetHandleInformation((HANDLE)sock, HANDLE_FLAG_INHERIT, cloexec ? 0 : HANDLE_FLAG_INHERIT);
+#elif defined(F_GETFD) && defined(F_SETFD) && defined(O_CLOEXEC)
+	const int curflags = fcntl(sock, F_GETFD);
+	int flags = curflags;
+	if (cloexec)
+		flags |= FD_CLOEXEC;
+	else
+		flags &= ~FD_CLOEXEC;
+	if (flags != curflags)
+		fcntl(sock, F_SETFD, flags);
+#endif
+}
+
 static void keep_sockalive(SOCKETTYPE fd)
 {
 	const int tcp_one = 1;
@@ -1721,7 +1737,8 @@ static enum send_ret __stratum_send(struct pool *pool, char *s, ssize_t len)
 
 	while (len > 0 ) {
 		struct timeval timeout = {1, 0};
-		ssize_t sent;
+		size_t sent = 0;
+		CURLcode rc;
 		fd_set wd;
 retry:
 		FD_ZERO(&wd);
@@ -1731,15 +1748,10 @@ retry:
 				goto retry;
 			return SEND_SELECTFAIL;
 		}
-#ifdef __APPLE__
-		sent = send(pool->sock, s + ssent, len, SO_NOSIGPIPE);
-#elif WIN32
-		sent = send(pool->sock, s + ssent, len, 0);
-#else
-		sent = send(pool->sock, s + ssent, len, MSG_NOSIGNAL);
-#endif
-		if (sent < 0) {
-			if (!sock_blocks())
+		rc = curl_easy_send(pool->stratum_curl, s + ssent, len, &sent);
+		if (rc != CURLE_OK)
+		{
+			if (rc != CURLE_AGAIN)
 				return SEND_SENDFAIL;
 			sent = 0;
 		}
@@ -1758,7 +1770,7 @@ bool stratum_send(struct pool *pool, char *s, ssize_t len)
 	enum send_ret ret = SEND_INACTIVE;
 
 	if (opt_protocol)
-		applog(LOG_DEBUG, "SEND: %s", s);
+		applog(LOG_DEBUG, "Pool %u: SEND: %s", pool->pool_no, s);
 
 	mutex_lock(&pool->stratum_lock);
 	if (pool->stratum_active)
@@ -1791,6 +1803,9 @@ static bool socket_full(struct pool *pool, int wait)
 	struct timeval timeout;
 	fd_set rd;
 
+	if (sock == INVSOCK)
+		return true;
+	
 	if (unlikely(wait < 0))
 		wait = 0;
 	FD_ZERO(&rd);
@@ -1813,20 +1828,18 @@ bool sock_full(struct pool *pool)
 
 static void clear_sockbuf(struct pool *pool)
 {
-	if (likely(pool->sockbuf))
-		strcpy(pool->sockbuf, "");
+	strcpy(pool->sockbuf, "");
 }
 
 static void clear_sock(struct pool *pool)
 {
-	ssize_t n;
+	size_t n = 0;
 
 	mutex_lock(&pool->stratum_lock);
 	do {
+		n = 0;
 		if (pool->sock)
-			n = recv(pool->sock, pool->sockbuf, RECVSIZE, 0);
-		else
-			n = 0;
+			curl_easy_recv(pool->stratum_curl, pool->sockbuf, RECVSIZE, &n);
 	} while (n > 0);
 	mutex_unlock(&pool->stratum_lock);
 
@@ -1882,19 +1895,23 @@ char *recv_line(struct pool *pool)
 		do {
 			char s[RBUFSIZE];
 			size_t slen;
-			ssize_t n;
+			size_t n = 0;
+			CURLcode rc;
 
 			memset(s, 0, RBUFSIZE);
-			n = recv(pool->sock, s, RECVSIZE, 0);
-			if (!n) {
+			rc = curl_easy_recv(pool->stratum_curl, s, RECVSIZE, &n);
+			if (rc == CURLE_OK && !n)
+			{
 				applog(LOG_DEBUG, "Socket closed waiting in recv_line");
 				suspend_stratum(pool);
 				break;
 			}
 			cgtime(&now);
 			waited = tdiff(&now, &rstart);
-			if (n < 0) {
-				if (!sock_blocks() || !socket_full(pool, DEFAULT_SOCKWAIT - waited)) {
+			if (rc != CURLE_OK)
+			{
+				if (rc != CURLE_AGAIN || !socket_full(pool, DEFAULT_SOCKWAIT - waited))
+				{
 					applog(LOG_DEBUG, "Failed to recv sock in recv_line");
 					suspend_stratum(pool);
 					break;
@@ -1926,11 +1943,12 @@ char *recv_line(struct pool *pool)
 	pool->cgminer_pool_stats.times_received++;
 	pool->cgminer_pool_stats.bytes_received += len;
 	pool->cgminer_pool_stats.net_bytes_received += len;
+
 out:
 	if (!sret)
 		clear_sock(pool);
 	else if (opt_protocol)
-		applog(LOG_DEBUG, "RECVD: %s", sret);
+		applog(LOG_DEBUG, "Pool %u: RECV: %s", pool->pool_no, sret);
 	return sret;
 }
 
@@ -2195,9 +2213,11 @@ static void __suspend_stratum(struct pool *pool)
 {
 	clear_sockbuf(pool);
 	pool->stratum_active = pool->stratum_notify = false;
-	if (pool->sock)
-		CLOSESOCKET(pool->sock);
-	pool->sock = 0;
+	if (pool->stratum_curl) {
+		curl_easy_cleanup(pool->stratum_curl);
+	}
+	pool->stratum_curl = NULL;
+	pool->sock = INVSOCK;
 }
 
 static bool parse_reconnect(struct pool *pool, json_t *val)
@@ -2684,143 +2704,115 @@ static bool sock_connecting(void)
 	return WSAGetLastError() == WSAEWOULDBLOCK;
 #endif
 }
-static bool setup_stratum_socket(struct pool *pool)
-{
-	struct addrinfo *servinfo, hints, *p;
-	char *sockaddr_url, *sockaddr_port;
-	int sockd;
 
+curl_socket_t grab_socket_opensocket_cb(void *clientp, __maybe_unused curlsocktype purpose, struct curl_sockaddr *addr)
+{
+	struct pool *pool = clientp;
+	curl_socket_t sck = bfg_socket(addr->family, addr->socktype, addr->protocol);
+	pool->sock = sck;
+	return sck;
+}
+
+static bool setup_stratum_curl(struct pool *pool)
+{
+	CURL *curl = NULL;
+	char s[RBUFSIZE];
+	bool ret = false;
+	bool tls_only = false, try_tls = true;
+	bool tlsca = true;
+	
+	applog(LOG_DEBUG, "initiate_stratum with sockbuf=%p", pool->sockbuf);
 	mutex_lock(&pool->stratum_lock);
 	pool->stratum_active = false;
-	if (pool->sock)
-		CLOSESOCKET(pool->sock);
-	pool->sock = 0;
-	mutex_unlock(&pool->stratum_lock);
+	pool->stratum_notify = false;
+	if (pool->stratum_curl)
+		curl_easy_cleanup(pool->stratum_curl);
+	pool->stratum_curl = curl_easy_init();
+	if (unlikely(!pool->stratum_curl))
+		quithere(1, "Failed to curl_easy_init");
+	if (pool->sockbuf)
+		pool->sockbuf[0] = '\0';
 
-	memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-
-	if (!pool->rpc_proxy && opt_socks_proxy) {
-		pool->rpc_proxy = opt_socks_proxy;
-		extract_sockaddr(pool->rpc_proxy, &pool->sockaddr_proxy_url, &pool->sockaddr_proxy_port);
-		pool->rpc_proxytype = PROXY_SOCKS5;
-	}
-
-	if (pool->rpc_proxy) {
-		sockaddr_url = pool->sockaddr_proxy_url;
-		sockaddr_port = pool->sockaddr_proxy_port;
-	} else {
-		sockaddr_url = pool->sockaddr_url;
-		sockaddr_port = pool->stratum_port;
-	}
-	if (getaddrinfo(sockaddr_url, sockaddr_port, &hints, &servinfo) != 0) {
-		if (!pool->probed) {
-			applog(LOG_WARNING, "Failed to resolve (?wrong URL) %s:%s",
-			       sockaddr_url, sockaddr_port);
-			pool->probed = true;
-		} else {
-			applog(LOG_INFO, "Failed to getaddrinfo for %s:%s",
-			       sockaddr_url, sockaddr_port);
-		}
-		return false;
-	}
-
-	for (p = servinfo; p != NULL; p = p->ai_next) {
-		sockd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-		if (sockd == -1) {
-			applog(LOG_DEBUG, "Failed socket");
-			continue;
-		}
-
-		/* Iterate non blocking over entries returned by getaddrinfo
-		 * to cope with round robin DNS entries, finding the first one
-		 * we can connect to quickly. */
-		noblock_socket(sockd);
-		if (connect(sockd, p->ai_addr, p->ai_addrlen) == -1) {
-			struct timeval tv_timeout = {1, 0};
-			int selret;
-			fd_set rw;
-
-			if (!sock_connecting()) {
-				CLOSESOCKET(sockd);
-				applog(LOG_DEBUG, "Failed sock connect");
-				continue;
-			}
-retry:
-			FD_ZERO(&rw);
-			FD_SET(sockd, &rw);
-			selret = select(sockd + 1, NULL, &rw, NULL, &tv_timeout);
-			if  (selret > 0 && FD_ISSET(sockd, &rw)) {
-				socklen_t len;
-				int err, n;
-
-				len = sizeof(err);
-				n = getsockopt(sockd, SOL_SOCKET, SO_ERROR, (void *)&err, &len);
-				if (!n && !err) {
-					applog(LOG_DEBUG, "Succeeded delayed connect");
-					block_socket(sockd);
-					break;
-				}
-			}
-			if (selret < 0 && interrupted())
-				goto retry;
-			CLOSESOCKET(sockd);
-			applog(LOG_DEBUG, "Select timeout/failed connect");
-			continue;
-		}
-		applog(LOG_WARNING, "Succeeded immediate connect");
-		block_socket(sockd);
-
-		break;
-	}
-	if (p == NULL) {
-		applog(LOG_INFO, "Failed to connect to stratum on %s:%s",
-		       sockaddr_url, sockaddr_port);
-		freeaddrinfo(servinfo);
-		return false;
-	}
-	freeaddrinfo(servinfo);
-
-	if (pool->rpc_proxy) {
-		switch (pool->rpc_proxytype) {
-			case PROXY_HTTP_1_0:
-				if (!http_negotiate(pool, sockd, true))
-					return false;
-				break;
-			case PROXY_HTTP:
-				if (!http_negotiate(pool, sockd, false))
-					return false;
-				break;
-			case PROXY_SOCKS5:
-			case PROXY_SOCKS5H:
-				if (!socks5_negotiate(pool, sockd))
-					return false;
-				break;
-			case PROXY_SOCKS4:
-				if (!socks4_negotiate(pool, sockd, false))
-					return false;
-				break;
-			case PROXY_SOCKS4A:
-				if (!socks4_negotiate(pool, sockd, true))
-					return false;
-				break;
-			default:
-				applog(LOG_WARNING, "Unsupported proxy type for %s:%s",
-				       pool->sockaddr_proxy_url, pool->sockaddr_proxy_port);
-				return false;
-				break;
-		}
-	}
+	curl = pool->stratum_curl;
 
 	if (!pool->sockbuf) {
-		pool->sockbuf = cgcalloc(RBUFSIZE, 1);
+		pool->sockbuf = calloc(RBUFSIZE, 1);
+		if (!pool->sockbuf)
+			quithere(1, "Failed to calloc pool sockbuf");
 		pool->sockbuf_size = RBUFSIZE;
 	}
 
-	pool->sock = sockd;
-	keep_sockalive(sockd);
-	return true;
+	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, pool->curl_err_str);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+	if (!opt_delaynet)
+		curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+
+	/* We use DEBUGFUNCTION to count bytes sent/received, and verbose is needed
+	 * to enable it */
+	curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_debug_cb);
+	curl_easy_setopt(curl, CURLOPT_DEBUGDATA, (void *)pool);
+	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
+
+	// CURLINFO_LASTSOCKET is broken on Win64 (which has a wider SOCKET type than curl_easy_getinfo returns), so we use this hack for now
+	curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, grab_socket_opensocket_cb);
+	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, pool);
+	
+	curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_TRY);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, (long)(tlsca ? 2 : 0));
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, (long)(tlsca ? 1 : 0));
+	if (pool->rpc_proxy) {
+		curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
+		curl_easy_setopt(curl, CURLOPT_PROXY, pool->rpc_proxy);
+	} else if (opt_socks_proxy) {
+		curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
+		curl_easy_setopt(curl, CURLOPT_PROXY, opt_socks_proxy);
+		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
+	}
+	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
+	
+retry:
+	/* Create a http url for use with curl */
+	sprintf(s, "http%s://%s:%s", try_tls ? "s" : "",
+	        pool->sockaddr_url, pool->stratum_port);
+	curl_easy_setopt(curl, CURLOPT_URL, s);
+	
+	pool->sock = INVSOCK;
+	if (curl_easy_perform(curl)) {
+		if (try_tls)
+		{
+			applog(LOG_DEBUG, "Stratum connect failed with TLS to pool %u: %s",
+			       pool->pool_no, pool->curl_err_str);
+			if (!tls_only)
+			{
+				try_tls = false;
+				goto retry;
+			}
+		}
+		else
+			applog(LOG_INFO, "Stratum connect failed to pool %d: %s",
+			       pool->pool_no, pool->curl_err_str);
+errout:
+		curl_easy_cleanup(curl);
+		pool->stratum_curl = NULL;
+		goto out;
+	}
+	if (pool->sock == INVSOCK)
+	{
+		applog(LOG_ERR, "Stratum connect succeeded, but technical problem extracting socket (pool %u)", pool->pool_no);
+		goto errout;
+	}
+	keep_sockalive(pool->sock);
+
+	pool->cgminer_pool_stats.times_sent++;
+	pool->cgminer_pool_stats.times_received++;
+	ret = true;
+
+out:
+	mutex_unlock(&pool->stratum_lock);
+	
+	return ret;
 }
 
 static char *get_sessionid(json_t *val)
@@ -2869,7 +2861,7 @@ bool initiate_stratum(struct pool *pool)
 	int n2size;
 
 resend:
-	if (!setup_stratum_socket(pool)) {
+	if (!setup_stratum_curl(pool)) {
 		sockd = false;
 		goto out;
 	}

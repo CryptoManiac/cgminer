@@ -69,6 +69,28 @@
 	#endif
 #endif
 
+extern void set_cloexec_socket(SOCKETTYPE, bool cloexec);
+
+static inline
+SOCKETTYPE bfg_socket(const int domain, const int type, const int protocol)
+{
+	const bool cloexec = true;
+	SOCKETTYPE sock;
+#ifdef WIN32
+# ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#  define WSA_FLAG_NO_HANDLE_INHERIT 0x80
+# endif
+	sock = WSASocket(domain, type, protocol, NULL, 0, WSA_FLAG_OVERLAPPED | ((cloexec) ? WSA_FLAG_NO_HANDLE_INHERIT : 0));
+	if (sock == INVSOCK)
+#endif
+	sock = socket(domain, type, protocol);
+	if (sock == INVSOCK)
+		return INVSOCK;
+	set_cloexec_socket(sock, cloexec);
+	return sock;
+}
+
+
 #define JSON_LOADS(str, err_ptr) json_loads((str), 0, (err_ptr))
 
 #ifdef HAVE_LIBCURL
